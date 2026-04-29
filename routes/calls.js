@@ -3894,6 +3894,45 @@ async function predictOutcomeFromRecording({ recordingUrl = null, callSid = null
 function smartExtractPtpDate(textLower) {
   const today = new Date();
   const maxDays = 5;
+  const monthMap = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
+  const spokenDayMap = {
+    ek: 1,
+    do: 2,
+    teen: 3,
+    tin: 3,
+    char: 4,
+    chaar: 4,
+    panch: 5,
+    paanch: 5,
+    chhe: 6,
+    chhah: 6,
+    saat: 7,
+    aath: 8,
+    nau: 9,
+    das: 10,
+    gyarah: 11,
+    barah: 12,
+    terah: 13,
+    chaudah: 14,
+    pandrah: 15,
+    solah: 16,
+    satrah: 17,
+    atharah: 18,
+    unnees: 19,
+    bees: 20,
+    ikkees: 21,
+    baais: 22,
+    teis: 23,
+    chaubis: 24,
+    pacchis: 25,
+    pachis: 25,
+    chhabbis: 26,
+    sattais: 27,
+    atthais: 28,
+    untees: 29,
+    tees: 30,
+    ikattis: 31,
+  };
   const clampDate = (d) => {
     const max = new Date(Date.now() + maxDays * 86400000);
     return (d > max ? max : d).toISOString().split('T')[0];
@@ -4016,18 +4055,29 @@ function smartExtractPtpDate(textLower) {
     }
   }
 
-  // 5. Numeric date: "12 ko", "15 tarikh", "15 april", "2 ko", "1 tarikh"
+  // 5. Spoken Roman Urdu day + month: "chaar may", "pandrah april"
+  const spokenWithMonth = normalizedDateText.match(/\b(ek|do|teen|tin|char|chaar|panch|paanch|chhe|chhah|saat|aath|nau|das|gyarah|barah|terah|chaudah|pandrah|solah|satrah|atharah|unnees|bees|ikkees|baais|teis|chaubis|pacchis|pachis|chhabbis|sattais|atthais|untees|tees|ikattis)\s*(january|february|march|april|may|june|july|august|september|october|november|december)\b/);
+  if (spokenWithMonth) {
+    const dayNum = spokenDayMap[spokenWithMonth[1]];
+    const monthNum = monthMap[spokenWithMonth[2]];
+    if (Number.isInteger(dayNum) && Number.isInteger(monthNum)) {
+      let target = new Date(today.getFullYear(), monthNum, dayNum);
+      if (target <= today) target.setFullYear(target.getFullYear() + 1);
+      return clampDate(target);
+    }
+  }
+
+  // 6. Numeric date: "12 ko", "15 tarikh", "15 april", "2 ko", "1 tarikh"
   const numMatch = normalizedDateText.match(/(\d{1,2})\s*(ko|tk|tak|tarikh|tarik|taarikh|april|may|june|july|march|february|january|august|september|october|november|december)/);
   if (numMatch) {
     const dayNum = parseInt(numMatch[1]);
-    const monthMap = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
     let month = monthMap[numMatch[2]] ?? today.getMonth();
     let target = new Date(today.getFullYear(), month, dayNum);
     if (target <= today) target.setMonth(target.getMonth() + 1);
     return clampDate(target);
   }
 
-  // 6. Urdu ordinal/cardinal numbers: "chaudah ko", "pandrahvi tarikh", "bees ko", "do pehli", "ek tarikh"
+  // 7. Urdu ordinal/cardinal numbers: "chaudah ko", "pandrahvi tarikh", "bees ko", "do pehli", "ek tarikh"
   const urduNumbers = {
     'pehli': 1, 'doosri': 2, 'teesri': 3, 'chauthi': 4, 'paanchvi': 5,
     'chhai': 6, 'saatvi': 7, 'aathvi': 8, 'nauvi': 9, 'dasvi': 10,
@@ -4062,7 +4112,7 @@ function smartExtractPtpDate(textLower) {
     }
   }
 
-  // 7. Vague commitment without specific date ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ default 2 days
+  // 8. Vague commitment without specific date ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ default 2 days
   const vagueCommitPatterns = [
     'kar dunga', 'kar dungi', 'de dunga', 'de dungi', 'bhej dunga', 'bhej dungi',
     'ho jayega', 'ho jayegi', 'pay karunga', 'pay karungi',
@@ -4073,7 +4123,7 @@ function smartExtractPtpDate(textLower) {
     if (normalizedDateText.includes(p)) return clampDate(new Date(Date.now() + 2 * 86400000));
   }
 
-  // 8. Default: 3 days
+  // 9. Default: 3 days
   return clampDate(new Date(Date.now() + 3 * 86400000));
 }
 
