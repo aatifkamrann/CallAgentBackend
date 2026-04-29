@@ -2156,7 +2156,10 @@ STRICT LINGUISTIC RULES:
 1a. INTERNAL THINKING (CRITICAL): NEVER speak your internal reasoning out loud. Do NOT say things like "Acknowledge and Initiate", "Moving on to consent phase", "Detailing Credit Card Dues", "My next step is", "I've outlined", "Per the flow". These are your PRIVATE thoughts ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the customer must NEVER hear them. ONLY speak the actual dialogue lines.
 2. NUMBERS & DECIMALS: Use "point" for decimals in English (e.g., "two point five percent"). For Urdu, say "teen percent" for 3%.
 3. ROUNDING: Always round off amounts in speech. Say "Atharah hazaar" instead of exact decimals.
-4. KEYWORDS: Inject these English words naturally: point, ${sirMadam.toLowerCase()}, interest, fees, bank, loan, cash, ensure, payment, credit card.
+4. KEYWORDS: Use English words naturally where needed: point, ${sirMadam.toLowerCase()}, interest, fees, bank, loan, cash, ensure, credit card. Avoid repeating the same keyword again and again.
+4a. NO HEADING READOUT (CRITICAL): NEVER speak labels/headings like "STRICT CONVERSATION FLOW", "SCENARIO RESPONSES", "TURN 1", "TURN 2", "PTP DATE COLLECTION", "CRITICAL RULES", "OFF-TOPIC", "CLOSING", "APPROACH", or numbered list items. These are internal instructions only.
+4b. ANTI-REPETITION (CRITICAL): Do NOT repeat the same noun in one sentence (example: "payment... payment..."). Use natural variants: dues, bill, amount, outstanding, commitment date.
+4c. HUMAN STYLE: Sound like a real Karachi caller. Add light, polite humor only when suitable (max one short humorous phrase in a turn), never sarcastic, never rude.
 5. REPETITION: If the customer asks you to repeat or says "kia kaha?", respond with the full sentence in clear Urdu. If audio is unclear, say "Awaaz thori clear nahi aa rahi, ${conv.customer_name} ${honorific}. Kya aap dobara bol sakte hain?" instead of "line clear nahi hai".
 6. SCOPE LIMIT: If asked for a loan, account, or other services, respond: "Main sirf aapke pending dues ke baare mein assist kar ${saktiVerb} hoon. Baqi cheezon ke liye aap hamesha JS Bank customer support ko call kar sakte hain ya apni qareebi branch visit kar sakte hain. JS Bank hamesha aapki khidmat ke liye hazir hai."
 7. ACCENT: Speak with natural Pakistani Karachi-style accent. Soft, friendly, conversational.
@@ -2287,6 +2290,7 @@ CRITICAL RULES:
 - Always start with opening greeting and WAIT for response
 - Match customer's tone and pace
 - Keep responses short, natural, conversational (1 sentence MAX per turn ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â NEVER give long paragraphs)
+- Natural wording only: no robotic repetition, no list-like speaking, no reading instruction text aloud.
 - Use natural Pakistani Urdu pronunciation
 - End call cleanly when appropriate ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â include [END_CALL] in response when conversation should end
 - Never repeat full introduction if customer loops
@@ -4344,6 +4348,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let pendingTurn2ContextAfterPreparedGreeting = false;
   let preparedGreetingPlayed = false;
   let postGreetingListenGate = false;
+  let postGreetingListenGateTimeout = null;  // Force-disable gate after 20s to prevent indefinite suppression
   let lastGreetingSource = 'none';
   let audioPacketsBufferedBeforeSetup = 0;
   let pickupRecoveryAttempts = 0;
@@ -4430,7 +4435,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
 
   // ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â AGENT RESPONSE WATCHDOG ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â nudge Gemini if no audio after customer speech ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
   let agentResponseWatchdog = null;
-  const AGENT_RESPONSE_TIMEOUT_MS = 8000;
+  const AGENT_RESPONSE_TIMEOUT_MS = 4500;
 
   function startAgentWatchdog() {
     clearAgentWatchdog();
@@ -4468,7 +4473,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let customerTranscriptBuffer = '';
   let customerTranscriptRawBuffer = '';
   let customerTranscriptTimer = null;
-  const CUSTOMER_TRANSCRIPT_DEBOUNCE_MS = 1000; // Faster flush so explicit non-customer cues are acted on before next agent turn
+  const CUSTOMER_TRANSCRIPT_DEBOUNCE_MS = 350; // Flush faster so first customer turn is handled with minimal delay
   let customerFirstWordLogged = false;
 
   let agentTranscriptBuffer = '';
@@ -4479,6 +4484,19 @@ export function handleMediaStream(twilioWs, initialConversationId) {
     customerTranscriptTimer = null;
     const fullText = customerTranscriptBuffer.trim();
     const fullRawText = customerTranscriptRawBuffer.trim();
+    const hasText = Boolean(fullText);
+    
+    // DIAGNOSTIC: Log all flush attempts, including suppressed ones
+    const flushState = [
+      hasText ? `TEXT="${fullText.substring(0,50)}"` : 'TEXT=<empty>',
+      `suppressed=${suppressCustomerInputDuringEnding}`,
+      `closing=${closingRequested}`,
+      `ending=${conversationEnded || forceEndingCall}`,
+      `lock=${greetingPlaybackLock}`,
+      `turns=${customerTurnsHeard}`,
+    ].join(' | ');
+    log.info('MEDIA', `[FLUSH-TX] ${flushState}`);
+    
     if (!fullText) {
       customerTranscriptBuffer = '';
       customerTranscriptRawBuffer = '';
@@ -4487,6 +4505,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
 
     // Suppress only if call is already ending; otherwise allow barge-in during greeting.
     if (suppressCustomerInputDuringEnding || closingRequested || finalClosingPlaybackLock) {
+      log.info('MEDIA', `[FLUSH-SUPPRESSED] Call ending, discarding buffered text: "${fullText.substring(0,50)}..."`);
       customerTranscriptBuffer = '';
       customerTranscriptRawBuffer = '';
       return;
@@ -4495,11 +4514,29 @@ export function handleMediaStream(twilioWs, initialConversationId) {
     if (greetingPlaybackLock) {
       // Customer spoke during greeting -> treat as immediate barge-in and continue live flow.
       greetingPlaybackLock = false;
+      customerTurnsHeard = 1;  // Increment turn counter so greeting-gate gets disabled
+      postGreetingListenGate = false;  // Disable gate immediately
+      if (postGreetingListenGateTimeout) clearTimeout(postGreetingListenGateTimeout);
       if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
         try { twilioWs.send(JSON.stringify({ event: 'clear', streamSid })); } catch {}
       }
-      log.info('MEDIA', `[BARGE-IN] Customer spoke during greeting, processing immediately: "${fullText.substring(0, 50)}..."`);
-      broadcast({ type: 'LOG', message: '[BARGE-IN] Greeting interrupted by customer speech', source: 'system' });
+      log.info('MEDIA', `[BARGE-IN] ✓ Customer interrupted greeting - gate DISABLED, processing immediately: "${fullText.substring(0, 60)}..."`);
+      broadcast({ type: 'LOG', message: '[BARGE-IN] Greeting interrupted - switching to live mode', source: 'system' });
+      
+      // Send immediate contextual response trigger to Gemini so it responds to what customer just said
+      if (wsGemini && wsGemini.readyState === WebSocket.OPEN) {
+        const bargeInContext = [
+          'Customer has interrupted the greeting.',
+          `Customer just said: "${fullText}"`,
+          'RESPOND IMMEDIATELY with one natural sentence in Roman Urdu.',
+          'Acknowledge what they said, then proceed to next step (consent).',
+          'Do NOT repeat greeting. Do NOT be silent. Speak NOW.',
+        ].join(' ');
+        log.info('MEDIA', `[BARGE-IN-CONTEXT] Sending immediate response trigger with customer speech`);
+        if (ensureOpeningInstruction(wsGemini, bargeInContext, 'barge_in_during_greeting')) {
+          pendingTurn2ContextAfterPreparedGreeting = false;  // Clear any pending prepared greeting context
+        }
+      }
     }
 
     customerTranscriptBuffer = '';
@@ -5065,6 +5102,19 @@ export function handleMediaStream(twilioWs, initialConversationId) {
     // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ EXTRA SAFETY: If non-customer flow is progressing to close, stop audio asap ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
     if (nonCustomerIntentLocked && (currentConversationState === 'NON_CUSTOMER' || closingRequested)) return false;
     if (!muLawBuffer?.length || !wsGemini || wsGemini.readyState !== WebSocket.OPEN) return false;
+
+    // Force-disable greeting gate after 12s of audio packets if no transcription yet
+    if (postGreetingListenGate && customerTurnsHeard === 0) {
+      const now = Date.now();
+      if (!customerSpeechDetectedAt) {
+        customerSpeechDetectedAt = now;
+        log.info('MEDIA', '[GATE-AUDIO] First audio packet to Gemini - monitoring for transcription...');
+      } else if (now - customerSpeechDetectedAt > 12000 && postGreetingListenGate) {
+        postGreetingListenGate = false;
+        if (postGreetingListenGateTimeout) clearTimeout(postGreetingListenGateTimeout);
+        log.warn('MEDIA', '[GATE-FORCE] Audio flowing 12s+ but no transcription - force disabling gate to allow response');
+      }
+    }
 
     const pcmBuffer = decodeTwilioToGemini(muLawBuffer);
     wsGemini.send(JSON.stringify({
@@ -6004,6 +6054,13 @@ Stay on the call. Keep negotiating. This is attempt ${ptpNegotiationAttempts}/${
     postGreetingListenGate = greetingSource !== 'connection-tone';
     if (postGreetingListenGate) {
       log.info('TIMING', `[GREETING-GATE] Enabled: waiting for first customer response before any further agent speech`);
+      if (postGreetingListenGateTimeout) clearTimeout(postGreetingListenGateTimeout);
+      postGreetingListenGateTimeout = setTimeout(() => {
+        if (postGreetingListenGate && customerTurnsHeard === 0) {
+          postGreetingListenGate = false;
+          log.warn('MEDIA', '[GREETING-GATE] Force-disabled after 20s timeout (no customer speech detected)');
+        }
+      }, 20000);
     }
 
     // Ã¢â€â‚¬Ã¢â€â‚¬ GREETING LOCK: Prevent customer interruption during minimum playback window Ã¢â€â‚¬Ã¢â€â‚¬
@@ -6325,7 +6382,10 @@ STRICT LINGUISTIC RULES:
    - NEVER ask "kab?" or "konsi date?" ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â instead propose: "Main kal ki date note kar loon? Matlab [tomorrow's full date]"
 3. NUMBERS & DECIMALS: Use "point" for decimals in English (e.g., "two point five percent"). For Urdu, say "teen percent" for 3%.
 4. ROUNDING: Always round off amounts in speech. Say "Atharah hazaar" instead of exact decimals.
-5. KEYWORDS: Inject these English words naturally: point, ${sirMadam.toLowerCase()}, interest, fees, bank, loan, cash, ensure, payment, credit card.
+5. KEYWORDS: Use English words naturally where needed: point, ${sirMadam.toLowerCase()}, interest, fees, bank, loan, cash, ensure, credit card. Avoid repeating the same keyword again and again.
+5a. NO HEADING READOUT (CRITICAL): NEVER speak labels/headings like "STRICT CONVERSATION FLOW", "SCENARIO RESPONSES", "TURN 1", "TURN 2", "PTP DATE COLLECTION", "CRITICAL RULES", "OFF-TOPIC", "CLOSING", "APPROACH", or numbered list items. These are internal instructions only.
+5b. ANTI-REPETITION (CRITICAL): Do NOT repeat the same noun in one sentence (example: "payment... payment..."). Use natural variants: dues, bill, amount, outstanding, commitment date.
+5c. HUMAN STYLE: Sound like a real Karachi caller. Add light, polite humor only when suitable (max one short humorous phrase in a turn), never sarcastic, never rude.
 6. REPETITION: If the customer asks you to repeat or says "kia kaha?", respond with the full sentence in clear Urdu.
 7. SCOPE LIMIT: If asked for a loan, account, or other services, respond: "Main sirf aapke pending dues ke baare mein assist kar ${saktiVerb} hoon. Baqi cheezon ke liye aap hamesha JS Bank customer support ko call ${custKarVerb} hain ya apni qareebi branch visit ${custKarVerb} hain. JS Bank hamesha aapki khidmat ke liye hazir hai."
 8. ACCENT: Speak with natural Pakistani Karachi-style accent. Soft, friendly, conversational.
@@ -6571,7 +6631,7 @@ FOLLOW-UP STRATEGY (CRITICAL):
             automatic_activity_detection: {
               disabled: false,
               prefix_padding_ms: 250,       // Capture more speech onset (was 100 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â missed first syllable)
-              silence_duration_ms: 700,      // Wait longer before assuming turn is done (was 500 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â cut off pauses)
+              silence_duration_ms: 450,      // Shorter VAD end-of-turn to reduce post-greeting response delay
             }
           }
         }
@@ -6591,6 +6651,38 @@ FOLLOW-UP STRATEGY (CRITICAL):
         const inputTx = sc?.inputTranscription || sc?.input_transcription;
         if (inputTx) {
           const customerText = inputTx.text;
+          // DIAGNOSTIC: Log ALL input transcription events with system state
+          const hasText = Boolean(customerText && customerText.trim());
+          const stateSummary = [
+            hasText ? `TEXT="${customerText.substring(0,50)}"` : 'TEXT=<empty>',
+            `setup=${geminiSetupComplete}`,
+            `ending=${conversationEnded || forceEndingCall || closingRequested ? 'YES' : 'NO'}`,
+            `gate=${postGreetingListenGate}`,
+            `turns=${customerTurnsHeard}`,
+            `lock=${greetingPlaybackLock}`,
+            `ws=${wsGemini?.readyState === WebSocket.OPEN ? 'OPEN' : 'CLOSED'}`
+          ].join(' | ');
+          log.info('MEDIA', `[INPUT-TX-EVENT] ${stateSummary}`);
+          
+          // CRITICAL FIX: If customer is speaking DURING greeting, disable gate immediately
+          // This ensures agent response is NOT suppressed (suppressEarlyAgentOutput check later)
+          try {
+            if (hasText && greetingPlaybackLock && postGreetingListenGate && customerTurnsHeard === 0) {
+              log.info('MEDIA', `[BIDIRECTIONAL-GATE] ✓ Customer speech detected during greeting - disabling gate NOW for live response`);
+              postGreetingListenGate = false;
+              customerTurnsHeard = 1;
+              if (postGreetingListenGateTimeout) {
+                clearTimeout(postGreetingListenGateTimeout);
+                postGreetingListenGateTimeout = null;
+              }
+            }
+          } catch (err) {
+            log.error('MEDIA', `[BIDIRECTIONAL-GATE-ERROR] ${err.message}`);
+          }
+          
+          if (!customerText && postGreetingListenGate && customerTurnsHeard === 0) {
+            log.info('MEDIA', `[GATE-DIAGNOSTIC] Empty input transcription during greeting-gate (likely VAD activity without recognized speech)`);
+          }
           if (customerText) {
             const rawCustomerTranscript = String(customerText || '').replace(/\s+/g, ' ').trim();
             const normalizedForLog = normalizeTranscriptToRomanUrdu(customerText);
@@ -6630,8 +6722,8 @@ FOLLOW-UP STRATEGY (CRITICAL):
               return;
             }
 
-            // SMART BARGE-IN: Only clear agent audio when Gemini confirms real customer speech
-            if (!greetingPlaybackLock && streamSid && twilioWs.readyState === WebSocket.OPEN) {
+            // SMART BARGE-IN: On confirmed customer speech, clear any in-flight agent audio immediately.
+            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
               try {
                 twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
               } catch {}
@@ -6652,11 +6744,13 @@ FOLLOW-UP STRATEGY (CRITICAL):
               if (pendingTurn2ContextAfterPreparedGreeting && wsGemini && wsGemini.readyState === WebSocket.OPEN) {
                 const firstCustomerLine = normalizeTranscriptToRomanUrdu(customerText);
                 const turn2Prompt = [
-                  'Prepared greeting is complete. Customer has now spoken.',
-                  firstCustomerLine ? `Customer said: "${firstCustomerLine}".` : 'Customer has spoken; respond naturally.',
-                  'Respond in one short Roman Urdu sentence acknowledging them, then move to consent step.',
-                  'Do NOT repeat greeting.',
+                  'Customer has spoken after greeting. Respond immediately.',
+                  firstCustomerLine ? `Customer said: "${firstCustomerLine}".` : 'Customer has spoken.',
+                  'Acknowledge their words naturally in ONE short Roman Urdu sentence.',
+                  'Then proceed to consent step.',
+                  'Do NOT repeat greeting. Do NOT be silent. Speak now.',
                 ].join(' ');
+                log.info('MEDIA', `[TURN-2-CONTEXT] Sending contextual response trigger with customer speech: "${firstCustomerLine.substring(0,60)}..."`);
                 if (ensureOpeningInstruction(wsGemini, turn2Prompt, 'first_customer_turn_after_prepared')) {
                   pendingTurn2ContextAfterPreparedGreeting = false;
                 }
@@ -6677,7 +6771,13 @@ FOLLOW-UP STRATEGY (CRITICAL):
                 log.info('MEDIA', `[SKIP] Suppressing buffered customer chunk after non-customer/closing lock: "${cleanedForBuffer}"`);
                 return;
               }
+              log.info('MEDIA', `[APPEND-TX] Buffering customer speech: "${cleanedForBuffer.substring(0,60)}" (will flush after ${CUSTOMER_TRANSCRIPT_DEBOUNCE_MS}ms debounce)`);
               appendCustomerTranscript(cleanedForBuffer, rawForTranscript || cleanedForBuffer);
+              if (greetingPlaybackLock || postGreetingListenGate) {
+                if (customerTranscriptTimer) clearTimeout(customerTranscriptTimer);
+                log.info('MEDIA', `[GATE-FLUSH] Flushed customer transcript immediately during gate (playback_lock=${Boolean(greetingPlaybackLock)}, listen_gate=${Boolean(postGreetingListenGate)})`);
+                flushCustomerTranscript();
+              }
             }
           }
         }
@@ -6692,12 +6792,18 @@ FOLLOW-UP STRATEGY (CRITICAL):
         }
         if (modelTurn?.parts) {
           const suppressEarlyAgentOutput = postGreetingListenGate && customerTurnsHeard === 0;
+          
+          // DIAGNOSTIC: Log gate suppression state
+          if (suppressEarlyAgentOutput) {
+            log.info('MEDIA', `[GATE-CHECK] Checking suppression: gate=${postGreetingListenGate}, turns=${customerTurnsHeard}, suppressed=${suppressEarlyAgentOutput}`);
+          }
+          
           for (const part of modelTurn.parts) {
             if (part.text) {
               if (suppressEarlyAgentOutput) {
                 if (!greetingGateSuppressionLogged.modelText) {
                   greetingGateSuppressionLogged.modelText = true;
-                  log.info('TIMING', `[GREETING-GATE] Suppressed pre-customer agent text chunk (further similar logs muted)`);
+                  log.warn('TIMING', `[GREETING-GATE] ⚠ Suppressed pre-customer agent text (gate=${postGreetingListenGate}, turns=${customerTurnsHeard}): "${part.text.substring(0,40)}..." (further similar logs muted)`);
                 }
                 continue;
               }
@@ -7009,14 +7115,18 @@ FOLLOW-UP STRATEGY (CRITICAL):
         }
 
         // Single-session flow: if no prepared payload, Gemini (same native session) will speak greeting.
-        const greetingPlayedNow = playPreparedGreeting({ allowToneFallback: false });
-        if (!greetingPlayedNow) {
-          log.info('CALL', '[GREETING][NATIVE_SESSION] No pre-rendered greeting payload; waiting for Gemini opening line in same session');
-        }
+        try {
+          const greetingPlayedNow = playPreparedGreeting({ allowToneFallback: false });
+          if (!greetingPlayedNow) {
+            log.info('CALL', '[GREETING][NATIVE_SESSION] No pre-rendered greeting payload; waiting for Gemini opening line in same session');
+          }
 
-        // If Gemini wasn't pre-connected (e.g. no conversationId initially), connect now
-        if (!wsGemini && !earlyGeminiStarted) {
-          startEarlyGeminiConnection();
+          // If Gemini wasn't pre-connected (e.g. no conversationId initially), connect now
+          if (!wsGemini && !earlyGeminiStarted) {
+            startEarlyGeminiConnection();
+          }
+        } catch (err) {
+          log.error('CALL', `[START-EVENT-ERROR] Greeting/Gemini init failed: ${err.message}`);
         }
         // Store metadata for Gemini setup (used by setupGeminiHandlers)
         startEventMetadata = metadata;
@@ -8071,6 +8181,11 @@ router.post('/make-call', async (req, res) => {
         preWs._greetingReady = false;
         let resolved = false;
         let greetingRequested = false;
+        let greetingRequestedAt = 0;
+        let greetingAudioParts = 0;
+        let greetingAudioBytes = 0;
+        let greetingFirstAudioAt = 0;
+        const PREWARM_GREETING_TIMEOUT_MS = 12000;
         let greetingTimeout = null;
         let greetingFinalizeTimer = null;
         const greetingMuLawChunks = [];
@@ -8169,6 +8284,7 @@ router.post('/make-call', async (req, res) => {
                       turn_complete: true,
                     },
                   }));
+                  greetingRequestedAt = Date.now();
                   log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Requested native greeting generation on prewarmed session`);
                 } catch (sendErr) {
                   done(false, `greeting_request_send_failed:${sendErr.message}`);
@@ -8177,9 +8293,13 @@ router.post('/make-call', async (req, res) => {
 
                 greetingTimeout = setTimeout(() => {
                   if (!preWs._greetingReady) {
-                    done(false, 'greeting_generation_timeout_8s');
+                    const elapsedMs = greetingRequestedAt ? (Date.now() - greetingRequestedAt) : 0;
+                    done(
+                      false,
+                      `greeting_generation_timeout_${PREWARM_GREETING_TIMEOUT_MS}ms(elapsed=${elapsedMs}ms,audio_parts=${greetingAudioParts},audio_bytes=${greetingAudioBytes},first_audio_after_ms=${greetingFirstAudioAt && greetingRequestedAt ? (greetingFirstAudioAt - greetingRequestedAt) : -1},setup_complete=${preWs._setupComplete === true})`
+                    );
                   }
-                }, 8000);
+                }, PREWARM_GREETING_TIMEOUT_MS);
               }
             }
 
@@ -8192,6 +8312,9 @@ router.post('/make-call', async (req, res) => {
                 const sampleRate = sampleRateMatch ? Number(sampleRateMatch[1]) : 24000;
                 try {
                   const pcmBuffer = Buffer.from(part.inlineData.data, 'base64');
+                  if (!greetingFirstAudioAt) greetingFirstAudioAt = Date.now();
+                  greetingAudioParts += 1;
+                  greetingAudioBytes += pcmBuffer.length;
                   const muLawBuffer = encodePcmRateToTwilio(pcmBuffer, sampleRate);
                   if (muLawBuffer.length) greetingMuLawChunks.push(muLawBuffer);
                 } catch {}
@@ -8219,7 +8342,8 @@ router.post('/make-call', async (req, res) => {
           }
         });
         PREWARMED_GEMINI_WS.set(convId, preWs);
-        // Strict preflight: require setupComplete + native greeting audio before dial.
+        // Preflight: require setupComplete before dial. If native greeting audio is missing,
+        // continue and let live Gemini generate greeting as a fallback.
         setTimeout(() => done(false, 'prewarm_incomplete_timeout_18s'), 18000);
         // Auto-cleanup after 45s if call never connects
         setTimeout(() => {
@@ -8242,7 +8366,7 @@ router.post('/make-call', async (req, res) => {
     const geminiReady = Boolean(preWsState && preWsState.readyState === WebSocket.OPEN && preWsState._setupComplete === true);
     const greetingReady = callAssets.openingGreetingPayloads?.length > 0;
     log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Pre-dial ready - Gemini: ${geminiReady ? 'READY(setupComplete)' : `not_ready(${geminiPrewarmOutcome.reason})`}, Greeting: ${greetingReady ? callAssets.openingGreetingPayloads.length + ' chunks(native)' : 'missing'}`);
-    if (!geminiReady || !greetingReady) {
+    if (!geminiReady) {
       const prepReason = [
         !geminiReady ? `gemini_not_ready(${geminiPrewarmOutcome.reason})` : null,
         !greetingReady ? `native_greeting_not_ready(source=${String(callAssets.greetingWarmSource || 'none')})` : null,
@@ -8262,6 +8386,12 @@ router.post('/make-call', async (req, res) => {
           geminiReason: geminiPrewarmOutcome.reason,
         },
       });
+    }
+
+    if (!greetingReady) {
+      const warmSource = String(callAssets.greetingWarmSource || 'none');
+      log.warn('CALL', `[PREP][GREETING_FALLBACK] native_greeting_not_ready(source=${warmSource}) -> continuing_with_live_gemini_opening`);
+      broadcast({ type: 'LOG', message: 'Prepared greeting unavailable; using live Gemini opening.', source: 'system' });
     }
 
     // ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
