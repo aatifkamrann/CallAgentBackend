@@ -20,65 +20,12 @@ import db from '../db.js';
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import crypto from 'crypto';
 import log, { sanitizeLogText } from '../logger.js';
 import { getRetryConfig } from '../scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RECORDINGS_DIR = path.join(__dirname, '..', 'data', 'recordings');
 if (!existsSync(RECORDINGS_DIR)) mkdirSync(RECORDINGS_DIR, { recursive: true });
-
-// Disk-backed cache for prepared greeting TTS audio.
-// Key = sha256(voice|gender|greetingText) -> binary mu-law buffer.
-// Eliminates Gemini TTS latency entirely for repeat calls with the same opening line.
-const GREETING_TTS_DISK_CACHE_DIR = path.join(__dirname, '..', 'data', 'greeting_tts_cache');
-if (!existsSync(GREETING_TTS_DISK_CACHE_DIR)) mkdirSync(GREETING_TTS_DISK_CACHE_DIR, { recursive: true });
-const GREETING_TTS_MEMORY_CACHE = new Map(); // cacheKey -> { payloads, muLawBuffer, durationMs, source }
-
-function greetingTtsCacheKey(voiceName, callerGender, text) {
-  return crypto.createHash('sha256')
-    .update(`${voiceName}|${callerGender}|${String(text || '').trim()}`)
-    .digest('hex');
-}
-
-function loadGreetingTtsFromDisk(cacheKey) {
-  if (GREETING_TTS_MEMORY_CACHE.has(cacheKey)) return GREETING_TTS_MEMORY_CACHE.get(cacheKey);
-  try {
-    const muLawPath = path.join(GREETING_TTS_DISK_CACHE_DIR, `${cacheKey}.mulaw`);
-    if (!existsSync(muLawPath)) return null;
-    const muLawBuffer = readFileSync(muLawPath);
-    if (!muLawBuffer.length) return null;
-    const payloads = chunkTwilioPayloads(muLawBuffer);
-    const entry = {
-      payloads,
-      muLawBuffer,
-      durationMs: Math.round((muLawBuffer.length / 8000) * 1000),
-      source: 'disk-cache',
-      mimeType: 'audio/mulaw;rate=8000',
-    };
-    GREETING_TTS_MEMORY_CACHE.set(cacheKey, entry);
-    return entry;
-  } catch (err) {
-    log.warn('CALL', `Greeting TTS disk-cache read failed: ${err.message}`);
-    return null;
-  }
-}
-
-function storeGreetingTtsToDisk(cacheKey, muLawBuffer, source) {
-  try {
-    const muLawPath = path.join(GREETING_TTS_DISK_CACHE_DIR, `${cacheKey}.mulaw`);
-    writeFileSync(muLawPath, muLawBuffer);
-    GREETING_TTS_MEMORY_CACHE.set(cacheKey, {
-      payloads: chunkTwilioPayloads(muLawBuffer),
-      muLawBuffer,
-      durationMs: Math.round((muLawBuffer.length / 8000) * 1000),
-      source: source || 'fresh',
-      mimeType: 'audio/mulaw;rate=8000',
-    });
-  } catch (err) {
-    log.warn('CALL', `Greeting TTS disk-cache write failed: ${err.message}`);
-  }
-}
 
 const router = Router();
 const GEMINI_TEXT_MODEL = 'gemini-2.5-flash';
@@ -336,7 +283,7 @@ const RESOURCE_LIMITS = {
   MAX_PREP_CACHE_SIZE: 50,           // Max entries in CALL_PREPARATION_CACHE
   MAX_PREWARM_WS: 10,               // Max pre-warmed Gemini WebSockets
   TWILIO_API_TIMEOUT_MS: 10000,      // 10s timeout for Twilio REST API calls
-  GEMINI_PREWARM_TIMEOUT_MS: 12000,  // Wait up to 12s for pre-warm setupComplete (Gemini listening-ready)
+  GEMINI_PREWARM_TIMEOUT_MS: 3000,   // 3s max wait for pre-warm
   TWILIO_STATUS_POLL_MS: 8000,       // Poll Twilio 8s after dial if no webhook callback received (faster cancel/no-answer detection)
   NO_PICKUP_FALLBACK_MS: 70000,      // Finalize as no-answer if call never reaches media stream
   CALL_PREP_TTL_MS: 5 * 60 * 1000,  // 5 min ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â discard stale prep cache entries
@@ -1034,19 +981,7 @@ function chunkTwilioPayloads(muLawBuffer, bytesPerChunk = 160) {
 async function generatePreparedGreetingAudio(voiceName, text, callerGender = 'male') {
   const apiKey = getGeminiApiKey();
   const safeVoiceName = normalizeVoiceName(voiceName, callerGender);
-  if (!apiKey) { log.warn('CALL', '[TTS] Skipped: no GEMINI_API_KEY'); return null; }
-  if (!safeVoiceName) { log.warn('CALL', `[TTS] Skipped: empty voice (raw='${voiceName}', gender='${callerGender}')`); return null; }
-  if (!text || !String(text).trim()) { log.warn('CALL', '[TTS] Skipped: empty greeting text'); return null; }
-
-  // 1) Try disk/memory cache first — instant, zero-latency win for repeat callers.
-  const cacheKey = greetingTtsCacheKey(safeVoiceName, callerGender, text);
-  const cached = loadGreetingTtsFromDisk(cacheKey);
-  if (cached && cached.payloads.length) {
-    log.info('CALL', `[TTS] Cache HIT (${cached.source}, ${cached.durationMs}ms, ${cached.payloads.length} chunks) voice=${safeVoiceName}`);
-    return { model: cached.source, mimeType: cached.mimeType, payloads: cached.payloads, muLawBuffer: cached.muLawBuffer, durationMs: cached.durationMs };
-  }
-
-  log.info('CALL', `[TTS] Cache MISS — generating (voice=${safeVoiceName}, gender=${callerGender}, chars=${String(text).length})`);
+  if (!apiKey || !safeVoiceName || !text) return null;
 
   const modelConfigs = [
     { model: 'gemini-2.5-flash-preview-tts', api: 'v1beta' },
@@ -1057,11 +992,7 @@ async function generatePreparedGreetingAudio(voiceName, text, callerGender = 'ma
 
   for (const { model, api } of modelConfigs) {
     const controller = new AbortController();
-    // Generous timeout — TTS first-token can be 4-8s; we run this during ringing
-    // so the user already pays a 10s pre-dial budget. Better to spend the time once
-    // and cache it forever than to fall back to silence on every call.
-    const timeoutId = setTimeout(() => controller.abort(), 12000);
-    const t0 = Date.now();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
 
     try {
       const response = await fetch(`https://generativelanguage.googleapis.com/${api}/models/${model}:generateContent?key=${apiKey}`, {
@@ -1084,8 +1015,7 @@ async function generatePreparedGreetingAudio(voiceName, text, callerGender = 'ma
       clearTimeout(timeoutId);
       const data = await response.json();
       if (!response.ok) {
-        lastError = `HTTP ${response.status}: ${data?.error?.message || JSON.stringify(data).slice(0, 200)}`;
-        log.warn('CALL', `[TTS] Model ${model} failed in ${Date.now()-t0}ms — ${lastError}`);
+        lastError = data?.error?.message || JSON.stringify(data);
         continue;
       }
 
@@ -1094,7 +1024,6 @@ async function generatePreparedGreetingAudio(voiceName, text, callerGender = 'ma
       const mimeType = audioPart?.inlineData?.mimeType || 'audio/L16;rate=24000';
       if (!audioBase64) {
         lastError = 'No audio returned for prepared greeting';
-        log.warn('CALL', `[TTS] Model ${model} returned no audio in ${Date.now()-t0}ms`);
         continue;
       }
 
@@ -1106,13 +1035,8 @@ async function generatePreparedGreetingAudio(voiceName, text, callerGender = 'ma
 
       if (payloads.length === 0) {
         lastError = 'Prepared greeting audio was empty after transcoding';
-        log.warn('CALL', `[TTS] Model ${model} produced empty audio after transcoding`);
         continue;
       }
-
-      log.info('CALL', `[TTS] Model ${model} succeeded in ${Date.now()-t0}ms (${payloads.length} chunks, ${Math.round(muLawBuffer.length/8)}ms audio)`);
-      // Persist for next time — same opening line + voice will skip TTS entirely.
-      storeGreetingTtsToDisk(cacheKey, muLawBuffer, model);
 
       return {
         model,
@@ -1123,12 +1047,11 @@ async function generatePreparedGreetingAudio(voiceName, text, callerGender = 'ma
       };
     } catch (error) {
       clearTimeout(timeoutId);
-      lastError = error?.name === 'AbortError' ? `Timed out after ${Date.now()-t0}ms warming greeting audio` : error.message;
-      log.warn('CALL', `[TTS] Model ${model} threw: ${lastError}`);
+      lastError = error?.name === 'AbortError' ? 'Timed out warming greeting audio' : error.message;
     }
   }
 
-  log.warn('CALL', `[TTS] Prepared greeting warm-up FAILED for voice=${safeVoiceName}: ${lastError || 'unknown error'}`);
+  log.warn('CALL', `Prepared greeting warm-up failed: ${lastError || 'unknown error'}`);
   return null;
 }
 
@@ -1141,7 +1064,6 @@ async function warmPreparedGreetingAudio(callAssets, conv) {
     'male'
   );
   const voiceName = normalizeVoiceName(callAssets?.voice || conv?.voice || conv?.callerVoice || 'Kore', callerGender);
-  log.info('CALL', `[TTS] warmPreparedGreetingAudio start — voice=${voiceName}, gender=${callerGender}, greetingChars=${callAssets.openingGreeting.length}`);
   const result = await generatePreparedGreetingAudio(voiceName, callAssets.openingGreeting, callerGender);
   if (!result) {
     // Do NOT use generic static-cache greeting when personalized caller identity is required.
@@ -4293,7 +4215,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
     const geminiURL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
     log.info('TIMING', `[T+${Date.now()-T0}ms] Gemini WS connecting (${forceFresh ? `reconnect:${reason}` : 'fresh'})...`);
     broadcast({ type: 'LOG', message: 'GEMINI: Pre-connecting...', source: 'gem' });
-    wsGemini = new WebSocket(geminiURL, { perMessageDeflate: false, skipUTF8Validation: true, handshakeTimeout: 5000 });
+    wsGemini = new WebSocket(geminiURL);
     wsGemini._expectedClose = false;
     updateRegistryGemini();
     setupGeminiHandlers(wsGemini);
@@ -4333,17 +4255,11 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let customerTurnsHeard = 0;
   let callAdvancedPastGreeting = false;
   let geminiSetupComplete = false;
-  let geminiSocketOpenedAt = 0;
-  let geminiSetupSentAt = 0;
-  let geminiSetupCompletedAt = 0;
   let greetingRequestSent = false;
   let openingInstructionSent = false;
-  let turn2ContextSent = false; // ✅ Flag for TURN 2 context instruction
   let preparedGreetingPlayed = false;
   let postGreetingListenGate = false;
   let lastGreetingSource = 'none';
-  // Cancel handle for in-flight greeting payload sends (set by sendTwilioPayloadSequence)
-  let cancelActiveGreetingPlayback = null;
   let audioPacketsBufferedBeforeSetup = 0;
   let pickupRecoveryAttempts = 0;
   let lastCustomerText = '';
@@ -4358,10 +4274,9 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let finalClosingPlaybackLock = false;
   let suppressCustomerInputDuringEnding = false;
   let finalClosingPromptSent = false;
-  let greetingPlaybackLock = false;  // SOFT LOCK: minimum window before treating very early audio as a real turn (still bidirectional — audio flows to Gemini, barge-in cancels greeting immediately when transcription arrives)
+  let greetingPlaybackLock = false;  // LOCK: Prevent customer interruption during greeting
   let greetingPlaybackStartedAt = 0; // Timestamp when greeting started
-  let greetingGateAutoReleaseLogged = false;
-  let greetingMinPlaybackMs = 700;   // Short floor so customer can naturally interrupt; greeting itself still plays in full unless customer actually speaks
+  let greetingMinPlaybackMs = 1700;  // Keep brief lock, but release sooner for faster interaction
   let endCause = { source: 'unknown', reason: 'not_set', details: null };
   let customerSpeechDetectedAt = 0;
   let forceEndingCall = false;
@@ -4373,21 +4288,10 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let agentPlaybackActiveUntil = 0;
   let lastNoiseActivityAt = 0;
   let twilioInboundGapAlertLevel = 0;
-  const greetingGateSuppressionLogSeen = {
-    agent_text: false,
-    output_tx: false,
-    top_output_tx: false,
-  };
-
-  function logGreetingGateSuppressionOnce(type, message) {
-    if (greetingGateSuppressionLogSeen[type]) return;
-    greetingGateSuppressionLogSeen[type] = true;
-    log.info('TIMING', message);
-  }
   const preSetupAudioBuffer = [];
   const MAX_PRE_SETUP_AUDIO_PACKETS = 150;
-  const INITIAL_CUSTOMER_RESPONSE_TIMEOUT_MS = 4000;
-  const CONNECTIVITY_FOLLOWUP_INTERVAL_MS = 5000;
+  const INITIAL_CUSTOMER_RESPONSE_TIMEOUT_MS = 9000;
+  const CONNECTIVITY_FOLLOWUP_INTERVAL_MS = 9000;
   const MAX_CONNECTIVITY_FOLLOWUPS = 5;
   let connectivityFollowupCount = 0;
   const GREETING_CHUNK_INTERVAL_MS = 20;
@@ -4436,7 +4340,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
 
   // ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â AGENT RESPONSE WATCHDOG ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â nudge Gemini if no audio after customer speech ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
   let agentResponseWatchdog = null;
-  const AGENT_RESPONSE_TIMEOUT_MS = 3500;
+  const AGENT_RESPONSE_TIMEOUT_MS = 8000;
 
   function startAgentWatchdog() {
     clearAgentWatchdog();
@@ -4447,24 +4351,10 @@ export function handleMediaStream(twilioWs, initialConversationId) {
       if (conversationEnded || forceEndingCall || closingRequested) return;
       log.warn('MEDIA', `[WATCHDOG] No agent audio for ${AGENT_RESPONSE_TIMEOUT_MS}ms after customer speech ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â nudging Gemini`);
       broadcast({ type: 'LOG', message: 'ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Agent response delayed ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â nudging AI', source: 'sys' });
-      const lastCustomerSnippet = (lastCustomerText || customerTranscriptBuffer || '').trim();
-      const flowHint = customerTurnsHeard > 0
-        ? 'Customer has already responded after greeting. Continue naturally from current flow. Do not restart greeting.'
-        : 'If customer has not responded yet, ask a short connectivity follow-up only.';
-      const nudgePrompt = [
-        'RESPOND NOW. Customer is waiting.',
-        flowHint,
-        lastCustomerSnippet
-          ? `Latest customer words: "${lastCustomerSnippet}". First answer this semantically, then continue.`
-          : 'No clear customer text available yet; keep your line short and context-safe.',
-        'Speak one short Roman Urdu sentence only.',
-        'Do NOT ask random payment questions out of context.',
-        'Do NOT think out loud.',
-      ].join(' ');
       try {
         wsGemini.send(JSON.stringify({
           client_content: {
-            turns: [{ role: 'user', parts: [{ text: nudgePrompt }] }],
+            turns: [{ role: 'user', parts: [{ text: 'RESPOND NOW. Customer is waiting. Speak immediately in Roman Urdu ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â give a brief, natural response. Do NOT think internally.' }] }],
             turn_complete: true,
           },
         }));
@@ -4488,7 +4378,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let customerTranscriptBuffer = '';
   let customerTranscriptRawBuffer = '';
   let customerTranscriptTimer = null;
-  const CUSTOMER_TRANSCRIPT_DEBOUNCE_MS = 300; // Faster handoff so customer barge-in during greeting is acknowledged almost immediately
+  const CUSTOMER_TRANSCRIPT_DEBOUNCE_MS = 1000; // Faster flush so explicit non-customer cues are acted on before next agent turn
   let customerFirstWordLogged = false;
 
   let agentTranscriptBuffer = '';
@@ -4498,36 +4388,17 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   function flushCustomerTranscript() {
     customerTranscriptTimer = null;
     const fullText = customerTranscriptBuffer.trim();
-    if (!fullText) return;
-
-    // BIDIRECTIONAL PRE-GREETING: if customer speaks during greeting, treat it as a real
-    // barge-in immediately — cancel any in-flight greeting chunks, release the soft lock,
-    // and process the speech right now (no deferral). Audio has been flowing to Gemini all
-    // along; this just ensures our local pipeline reacts in <100ms instead of waiting.
-    if (greetingPlaybackLock && !suppressCustomerInputDuringEnding && !closingRequested && !finalClosingPlaybackLock) {
-      log.info('BARGE-IN', `Customer spoke during greeting — cancelling greeting playback and processing immediately: "${fullText.substring(0, 50)}..."`);
-      broadcast({ type: 'LOG', message: `[BARGE-IN] Greeting interrupted by customer`, source: 'system' });
-      try { if (typeof cancelActiveGreetingPlayback === 'function') cancelActiveGreetingPlayback(); } catch {}
-      cancelActiveGreetingPlayback = null;
-      greetingPlaybackLock = false;
-      try {
-        if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
-        }
-      } catch {}
-      // Fall through to normal processing below
-    }
-
-    // Suppress customer processing while ending/closing. In this case we drop
-    // pending text intentionally to avoid re-opening dialogue during hangup.
-    if (suppressCustomerInputDuringEnding || closingRequested || finalClosingPlaybackLock) {
-      customerTranscriptBuffer = '';
-      customerTranscriptRawBuffer = '';
-      return;
-    }
-
     customerTranscriptBuffer = '';
     customerTranscriptRawBuffer = '';
+    // Ã¢â€â‚¬Ã¢â€â‚¬ SUPPRESS DURING: ending message, final closing lock, OR greeting playback lock Ã¢â€â‚¬Ã¢â€â‚¬
+    if (suppressCustomerInputDuringEnding || closingRequested || finalClosingPlaybackLock || greetingPlaybackLock) {
+      if (greetingPlaybackLock) {
+        log.info('GREETING-LOCK-SUPPRESS', `Ignoring customer speech during greeting: "${fullText.substring(0, 50)}..."`);
+        broadcast({ type: 'LOG', message: `[GREETING LOCK] Suppressing customer input`, source: 'system' });
+      }
+      return;
+    }
+    if (!fullText) return;
 
     const normalizedText = normalizeTranscriptToRomanUrdu(fullText);
     const cleanText = pushMessage('customer', normalizedText);
@@ -4652,12 +4523,11 @@ export function handleMediaStream(twilioWs, initialConversationId) {
       : { allowToneFallback: true };
     const { payloadsToPlay } = resolveGreetingPayloads(callAssets, voiceName, retryGreetingOptions);
     if (!streamSid || !payloadsToPlay.length || twilioWs.readyState !== WebSocket.OPEN) return;
-    const replayHandle = sendTwilioPayloadSequence(payloadsToPlay, {
+    sendTwilioPayloadSequence(payloadsToPlay, {
       intervalMs: GREETING_CHUNK_INTERVAL_MS,
       initialDelayMs: GREETING_START_DELAY_MS,
       stopIf: () => customerTurnsHeard > 0 || conversationEnded || forceEndingCall || closingRequested,
     });
-    cancelActiveGreetingPlayback = replayHandle?.cancel || null;
     log.info('MEDIA', `[GREETING] Replayed audio-only (${payloadsToPlay.length} chunks)`);
   }
 
@@ -4665,23 +4535,16 @@ export function handleMediaStream(twilioWs, initialConversationId) {
     const intervalMs = Number(options.intervalMs || 20);
     const initialDelayMs = Number(options.initialDelayMs || 0);
     const stopIf = typeof options.stopIf === 'function' ? options.stopIf : () => false;
-    const onCancel = typeof options.onCancel === 'function' ? options.onCancel : null;
 
-    if (!Array.isArray(payloads) || payloads.length === 0) return { count: 0, cancel: () => {} };
-    if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return { count: 0, cancel: () => {} };
+    if (!Array.isArray(payloads) || payloads.length === 0) return 0;
+    if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return 0;
 
     const estimatedPlaybackMs = initialDelayMs + (payloads.length * intervalMs) + 1400;
     agentPlaybackActiveUntil = Math.max(agentPlaybackActiveUntil, Date.now() + estimatedPlaybackMs);
 
-    // Track scheduled timeouts so we can cancel in-flight playback on barge-in
-    const pendingTimeouts = new Array(payloads.length);
-    let cancelled = false;
-
     payloads.forEach((payload, idx) => {
       const when = initialDelayMs + idx * intervalMs;
-      pendingTimeouts[idx] = setTimeout(() => {
-        pendingTimeouts[idx] = null;
-        if (cancelled) return;
+      setTimeout(() => {
         if (stopIf()) return;
         if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
         try {
@@ -4697,18 +4560,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
       }, when);
     });
 
-    const cancel = () => {
-      if (cancelled) return;
-      cancelled = true;
-      for (let i = 0; i < pendingTimeouts.length; i++) {
-        if (pendingTimeouts[i]) { clearTimeout(pendingTimeouts[i]); pendingTimeouts[i] = null; }
-      }
-      // Truncate the outbound estimate so downstream gating doesn't keep blocking
-      agentPlaybackActiveUntil = Math.min(agentPlaybackActiveUntil, Date.now() + 200);
-      if (onCancel) { try { onCancel(); } catch {} }
-    };
-
-    return { count: payloads.length, cancel };
+    return payloads.length;
   }
 
   // ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â SILENCE TIMEOUT ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 3 nudges (30s each) with context resume, then polite goodbye ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
@@ -6053,12 +5905,11 @@ Stay on the call. Keep negotiating. This is attempt ${ptpNegotiationAttempts}/${
     greetingPlaybackStartedAt = Date.now();
     log.info('GREETING-LOCK', `[T+${Date.now()-T0}ms] Greeting lock ENGAGED`);
 
-    const greetingHandle = sendTwilioPayloadSequence(payloadsToPlay, {
+    sendTwilioPayloadSequence(payloadsToPlay, {
       intervalMs: GREETING_CHUNK_INTERVAL_MS,
       initialDelayMs: GREETING_START_DELAY_MS,
       stopIf: () => customerTurnsHeard > 0 || conversationEnded || forceEndingCall || closingRequested,
     });
-    cancelActiveGreetingPlayback = greetingHandle?.cancel || null;
 
     if (greetingSource !== 'connection-tone') {
       const cleanGreeting = pushMessage('agent', callAssets?.openingGreeting || '');
@@ -6076,9 +5927,8 @@ Stay on the call. Keep negotiating. This is attempt ${ptpNegotiationAttempts}/${
     const greetingPlaybackMs = Math.max(1200, payloadsToPlay.length * GREETING_CHUNK_INTERVAL_MS + GREETING_START_DELAY_MS);
     agentPlaybackActiveUntil = Math.max(agentPlaybackActiveUntil, Date.now() + greetingPlaybackMs + 300);
     
-    // Ã¢â€â‚¬Ã¢â€â‚¬ GREETING LOCK RELEASE: keep this short so interruption is accepted quickly.
-    // Do not tie to full greeting playback length, otherwise long greetings delay listening.
-    const lockReleaseDelay = greetingMinPlaybackMs;
+    // Ã¢â€â‚¬Ã¢â€â‚¬ GREETING LOCK RELEASE: Unlock after minimum playback window OR when customer speaks early Ã¢â€â‚¬Ã¢â€â‚¬
+    const lockReleaseDelay = Math.max(greetingPlaybackMs, greetingMinPlaybackMs);
     setTimeout(() => {
       greetingPlaybackLock = false;
       log.info('GREETING-LOCK', `[T+${Date.now()-T0}ms] Greeting lock RELEASED (after ${lockReleaseDelay}ms)`);
@@ -6111,7 +5961,7 @@ Stay on the call. Keep negotiating. This is attempt ${ptpNegotiationAttempts}/${
       return `You are on a live phone call. The customer just picked up. Greet them once with EXACTLY this line: "${greetingText}" and then STOP. If the customer starts speaking before or during that greeting, stop greeting immediately, listen first, and answer their latest words instead of finishing the scripted greeting. Ignore background noise. Do NOT greet twice. Do NOT go to consent until after the customer response.`;
     }
     // Pre-recorded greeting was played ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â tell Gemini not to repeat
-    return `The opening greeting "${greetingText}" has ALREADY been spoken to the customer via pre-recorded audio. The greeting is complete. Your task now is to LISTEN ONLY - DO NOT output any audio or speech right now. Wait for the customer to respond. Once you receive customer audio input, then respond appropriately. Process their words when they arrive and reply in TURN 2 (consent step). Do NOT say anything right now. Do NOT say "Shukriya". Do NOT say the greeting again. Only listen and wait for customer input.`;
+    return `The opening greeting "${greetingText}" has ALREADY been spoken to the customer via pre-recorded audio. DO NOT repeat it. Wait silently for the customer to respond. If any buffered or overlapping customer speech arrives, treat that speech as priority and respond to it first. When they respond, continue from TURN 2 (consent step). Do NOT say the greeting again.`;
   }
 
   // Send Gemini instruction to trigger greeting or consent step, but only if we haven't already sent it for this call (avoid duplicates during pre
@@ -6122,65 +5972,14 @@ Stay on the call. Keep negotiating. This is attempt ${ptpNegotiationAttempts}/${
       return false;
     }
 
-    try {
-      geminiWs.send(JSON.stringify({
-        client_content: {
-          turns: [{ role: 'user', parts: [{ text: instructionText }] }],
-          turn_complete: true,
-        },
-      }));
-      openingInstructionSent = true;
-      return true;
-    } catch (err) {
-      log.error('MEDIA', `[GREETING] Failed to send opening instruction (${trigger}): ${err.message}`);
-      return false;
-    }
-  }
-
-  // ✅ Send TURN 2 context instruction after greeting instruction
-  function sendTurn2ContextInstruction(geminiWs, trigger = 'after_greeting') {
-    if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return false;
-    if (turn2ContextSent) {
-      log.info('MEDIA', `[TURN 2] Context instruction already sent - skipping duplicate (${trigger})`);
-      return false;
-    }
-
-    const custName = conv?.customer_name || 'customer';
-    const custGender = normalizeGender(conv?.customer_gender || callAssets?.customer_gender || 'male', 'male');
-    const honor = custGender === 'female' ? 'Bibi' : 'Sahab';
-    
-    // ✅ This is the TURN 2 context - what to do when customer speaks
-    const turn2Instruction = `TURN 2 - WAITING FOR CUSTOMER RESPONSE:
-You have finished the opening greeting. The customer is now expected to respond. Here is what you must do:
-
-1. LISTEN: Wait for the customer to speak and respond to your greeting.
-2. RESPOND: When the customer speaks, acknowledge them briefly (e.g., "Walaikum Assalam Sahab" or "Ji haan").
-3. TRANSITION TO CONSENT: After acknowledging, immediately move to the payment discussion. Ask: "${custName} ${honor}, main aapse aapke credit card dues ke baare mein baat karna chahta/chahti hoon, kya ye munasib waqt hai?"
-4. WAIT: Stop speaking and wait for their response before continuing.
-
-CRITICAL REMINDERS:
-- Do NOT say "Shukriya" or any thank you phrase after greeting - just acknowledge and ask about payment.
-- Do NOT repeat the greeting.
-- Do NOT add filler words or extra sentences.
-- When customer speaks, respond in ONE clear sentence maximum.
-- If they say "yes/haan", move directly to the payment details.
-- If they say "no/busy", ask when you can call back.
-- Keep responses brief and professional.`;
-
-    try {
-      geminiWs.send(JSON.stringify({
-        client_content: {
-          turns: [{ role: 'user', parts: [{ text: turn2Instruction }] }],
-          turn_complete: true,
-        },
-      }));
-      turn2ContextSent = true;
-      log.info('MEDIA', `[TURN 2] Context instruction sent (${trigger})`);
-      return true;
-    } catch (err) {
-      log.error('MEDIA', `[TURN 2] Failed to send context instruction (${trigger}): ${err.message}`);
-      return false;
-    }
+    geminiWs.send(JSON.stringify({
+      client_content: {
+        turns: [{ role: 'user', parts: [{ text: instructionText }] }],
+        turn_complete: true,
+      },
+    }));
+    openingInstructionSent = true;
+    return true;
   }
 
   function setupGeminiHandlers(geminiWs) {
@@ -6191,7 +5990,6 @@ CRITICAL REMINDERS:
       geminiWs._expectedClose = false;
       geminiSetupFailed = false;
       geminiFailureReason = '';
-      geminiSocketOpenedAt = Date.now();
       log.info('TIMING', `[T+${Date.now()-T0}ms] Gemini WebSocket OPEN`);
       broadcast({ type: 'LOG', message: 'GEMINI: Connected', source: 'gem' });
 
@@ -6226,21 +6024,15 @@ CRITICAL REMINDERS:
               // Send smart greeting instruction BEFORE flushing audio
               const smartInstruction = buildGeminiGreetingInstruction(exactOpeningGreetingForSetup, true);
               sendOpeningInstructionOnce(geminiWs, smartInstruction, 'prewarm_instant_fallback');
-              // ✅ Send TURN 2 context right after greeting instruction
-              setTimeout(() => { sendTurn2ContextInstruction(geminiWs, 'prewarm_instant_fallback_turn2'); }, 100);
-              const flushDelayMs = customerTurnsHeard > 0 ? 0 : 300;
               setTimeout(() => {
                 flushBufferedInboundAudio('prewarm_setup_complete_after_greeting');
-              }, flushDelayMs);
+              }, 300);
             } else if (geminiWs.readyState === WebSocket.OPEN) {
               const smartInstruction = buildGeminiGreetingInstruction(exactOpeningGreetingForSetup, false);
               sendOpeningInstructionOnce(geminiWs, smartInstruction, 'prewarm_instant_prepared');
-              // ✅ Send TURN 2 context right after greeting instruction
-              setTimeout(() => { sendTurn2ContextInstruction(geminiWs, 'prewarm_instant_prepared_turn2'); }, 100);
-              const flushDelayMs = customerTurnsHeard > 0 ? 0 : 120;
               setTimeout(() => {
                 flushBufferedInboundAudio('prewarm_setup_complete');
-              }, flushDelayMs);
+              }, 120);
             } else {
               flushBufferedInboundAudio('prewarm_setup_complete');
             }
@@ -6626,20 +6418,9 @@ FOLLOW-UP STRATEGY (CRITICAL):
           }
         }
       };
-      try {
-        geminiWs.send(JSON.stringify(setupMsg));
-        geminiWs._setupSent = true;
-        geminiWs._setupSentAt = Date.now();
-        geminiSetupSentAt = geminiWs._setupSentAt;
-        const openToSetupMs = geminiSocketOpenedAt ? (geminiSetupSentAt - geminiSocketOpenedAt) : null;
-        log.info('TIMING', `[T+${Date.now()-T0}ms] Setup msg sent, voice: ${voiceName}${openToSetupMs != null ? `, open->setup=${openToSetupMs}ms` : ''}`);
-        broadcast({ type: 'LOG', message: `Voice: ${voiceName}`, source: 'gem' });
-      } catch (setupSendErr) {
-        geminiSetupFailed = true;
-        geminiFailureReason = `setup_send_failed: ${setupSendErr.message}`;
-        log.error('TIMING', `[SETUP-ERROR] Failed to send setup msg: ${setupSendErr.message}`);
-        broadcast({ type: 'LOG', message: `GEMINI setup send failed: ${setupSendErr.message}`, source: 'gem' });
-      }
+      geminiWs.send(JSON.stringify(setupMsg));
+      log.info('TIMING', `[T+${Date.now()-T0}ms] Setup msg sent, voice: ${voiceName}`);
+      broadcast({ type: 'LOG', message: `Voice: ${voiceName}`, source: 'gem' });
     });
 
     // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Gemini message handler ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â handles both camelCase and snake_case ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
@@ -6668,11 +6449,7 @@ FOLLOW-UP STRATEGY (CRITICAL):
                 const now = Date.now();
                 if (now - lastNoiseActivityAt > 1200) {
                   lastNoiseActivityAt = now;
-                  // Do not keep resetting the full timer on every noise packet; that can
-                  // starve connectivity follow-up and make the call feel unresponsive.
-                  if (!initialCustomerResponseTimer) {
-                    startInitialCustomerResponseTimer(Math.min(INITIAL_CUSTOMER_RESPONSE_TIMEOUT_MS, 4500));
-                  }
+                  startInitialCustomerResponseTimer(INITIAL_CUSTOMER_RESPONSE_TIMEOUT_MS);
                 }
               }
               if (customerTurnsHeard > 0) {
@@ -6712,13 +6489,6 @@ FOLLOW-UP STRATEGY (CRITICAL):
               cancelGreetingRetryTimer();
               clearInitialCustomerResponseTimer();
               clearGracefulHangupTimer(); // Cancel any greeting-timeout hangup
-              // BIDIRECTIONAL PRE-GREETING: cut greeting playback the instant Gemini confirms a real customer turn
-              if (greetingPlaybackLock || typeof cancelActiveGreetingPlayback === 'function') {
-                try { if (typeof cancelActiveGreetingPlayback === 'function') cancelActiveGreetingPlayback(); } catch {}
-                cancelActiveGreetingPlayback = null;
-                greetingPlaybackLock = false;
-                log.info('BARGE-IN', `Greeting playback cancelled on first customer turn (Gemini transcription path)`);
-              }
               log.info('MEDIA', `[GREETING] Customer responded ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â greeting loop cancelled, proceeding to live conversation`);
             }
             resetSilenceTimer();
@@ -6750,22 +6520,11 @@ FOLLOW-UP STRATEGY (CRITICAL):
           flushCustomerTranscript();
         }
         if (modelTurn?.parts) {
-          let suppressEarlyAgentOutput = postGreetingListenGate && customerTurnsHeard === 0;
-          if (suppressEarlyAgentOutput && greetingPlaybackStartedAt > 0) {
-            const gateAgeMs = Date.now() - greetingPlaybackStartedAt;
-            if (gateAgeMs > 2500) {
-              postGreetingListenGate = false;
-              suppressEarlyAgentOutput = false;
-              if (!greetingGateAutoReleaseLogged) {
-                greetingGateAutoReleaseLogged = true;
-                log.info('TIMING', `[GREETING-GATE] Auto-released after ${gateAgeMs}ms to avoid suppression deadlock`);
-              }
-            }
-          }
+          const suppressEarlyAgentOutput = postGreetingListenGate && customerTurnsHeard === 0;
           for (const part of modelTurn.parts) {
             if (part.text) {
               if (suppressEarlyAgentOutput) {
-                logGreetingGateSuppressionOnce('agent_text', `[GREETING-GATE] Suppressed pre-customer agent text chunk (logging once)`);
+                log.info('TIMING', `[GREETING-GATE] Suppressed pre-customer agent text chunk`);
                 continue;
               }
               // Filter thinking text immediately (don't even buffer it)
@@ -6854,7 +6613,7 @@ FOLLOW-UP STRATEGY (CRITICAL):
         // Process output transcription once per server message (not once per part)
         if (outputTx?.text) {
           if (postGreetingListenGate && customerTurnsHeard === 0) {
-            logGreetingGateSuppressionOnce('output_tx', `[GREETING-GATE] Suppressed pre-customer output transcription (logging once)`);
+            log.info('TIMING', `[GREETING-GATE] Suppressed pre-customer output transcription`);
           } else {
           const agentTranscript = outputTx.text;
           if (isThinkingText(agentTranscript)) {
@@ -6870,7 +6629,7 @@ FOLLOW-UP STRATEGY (CRITICAL):
         const topOutputTx = sc?.outputTranscription || sc?.output_transcription;
         if (topOutputTx?.text && !modelTurn?.parts) {
           if (postGreetingListenGate && customerTurnsHeard === 0) {
-            logGreetingGateSuppressionOnce('top_output_tx', `[GREETING-GATE] Suppressed pre-customer top-level transcription (logging once)`);
+            log.info('TIMING', `[GREETING-GATE] Suppressed pre-customer top-level transcription`);
           } else {
           const agentTranscript = topOutputTx.text;
           if (isThinkingText(agentTranscript)) {
@@ -6885,16 +6644,10 @@ FOLLOW-UP STRATEGY (CRITICAL):
         // Handle setup complete
         if (response.setupComplete || response.setup_complete) {
           geminiSetupComplete = true;
-          geminiWs._setupComplete = true;
           geminiSetupFailed = false;
           geminiFailureReason = '';
-          geminiSetupCompletedAt = Date.now();
           startGeminiKeepalive();
-          const setupSentAt = geminiWs._setupSentAt || geminiSetupSentAt || 0;
-          const openAt = geminiSocketOpenedAt || 0;
-          const setupLatencyMs = setupSentAt ? (geminiSetupCompletedAt - setupSentAt) : null;
-          const openToReadyMs = openAt ? (geminiSetupCompletedAt - openAt) : null;
-          log.info('TIMING', `[T+${Date.now()-T0}ms] Gemini setupComplete ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â READY${setupLatencyMs != null ? `, setup->ready=${setupLatencyMs}ms` : ''}${openToReadyMs != null ? `, open->ready=${openToReadyMs}ms` : ''}`);
+          log.info('TIMING', `[T+${Date.now()-T0}ms] Gemini setupComplete ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â READY`);
           if (audioPacketsBufferedBeforeSetup > 0) {
             log.info('MEDIA', `Buffered ${audioPacketsBufferedBeforeSetup} inbound audio packets before setupComplete`, {
               audioPacketsBufferedBeforeSetup,
@@ -6939,7 +6692,6 @@ FOLLOW-UP STRATEGY (CRITICAL):
           const usedPreparedGreeting = preparedGreetingPlayed || playPreparedGreeting();
           if (usedPreparedGreeting) {
             const greetingWasFallback = lastGreetingSource === 'connection-tone' || lastGreetingSource === 'none';
-            log.info('TIMING', `[GREETING-SETUP] setupComplete handled, greetingSource=${lastGreetingSource}, fallback=${greetingWasFallback}, preparedPlayed=${preparedGreetingPlayed}`);
             
             if (greetingWasFallback && geminiWs && geminiWs.readyState === WebSocket.OPEN) {
               // CRITICAL: Smart greeting ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â if customer already spoke, skip greeting
@@ -6948,19 +6700,17 @@ FOLLOW-UP STRATEGY (CRITICAL):
                 log.info('MEDIA', `ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¢ Smart greeting instruction (customerTurns=${customerTurnsHeard})`);
               }
               // Flush audio AFTER instruction so Gemini prioritizes response
-              const flushDelayMs = customerTurnsHeard > 0 ? 0 : 300;
               setTimeout(() => {
                 flushBufferedInboundAudio('setup_complete_after_greeting');
-              }, flushDelayMs);
+              }, 300);
             } else if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
               const smartInstruction = buildGeminiGreetingInstruction(exactOpeningGreetingForSetup, false);
               if (sendOpeningInstructionOnce(geminiWs, smartInstruction, 'setup_complete_prepared')) {
                 log.info('MEDIA', `ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¢ Smart greeting instruction (customerTurns=${customerTurnsHeard})`);
               }
-              const flushDelayMs = customerTurnsHeard > 0 ? 0 : 120;
               setTimeout(() => {
                 flushBufferedInboundAudio('setup_complete');
-              }, flushDelayMs);
+              }, 120);
             } else {
               flushBufferedInboundAudio('setup_complete');
             }
@@ -6977,8 +6727,7 @@ FOLLOW-UP STRATEGY (CRITICAL):
           }
         }
       } catch (err) {
-        const raw = String(data || '').slice(0, 220).replace(/\s+/g, ' ');
-        log.error('MEDIA', `Gemini message parse error: ${err.message}; raw=${raw}`);
+        log.error('MEDIA', 'Gemini message parse error:', err.message);
       }
     });
 
@@ -8126,18 +7875,14 @@ router.post('/make-call', async (req, res) => {
       geminiPrewarmPromise = new Promise((resolve) => {
         const geminiURL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${geminiApiKey}`;
         log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Gemini WS pre-connecting + pre-setup...`);
-        const preWs = new WebSocket(geminiURL, { perMessageDeflate: false, skipUTF8Validation: true, handshakeTimeout: 5000 });
+        const preWs = new WebSocket(geminiURL);
         preWs._prewarmCreatedAt = Date.now();
         preWs._setupSent = false;
         preWs._setupComplete = false;
-        preWs._openedAt = 0;
-        preWs._setupSentAt = 0;
-        preWs._setupCompleteAt = 0;
         let resolved = false;
         const done = () => { if (!resolved) { resolved = true; resolve(); } };
         
         preWs.on('open', () => {
-          preWs._openedAt = Date.now();
           log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Gemini WS OPEN (pre-dial) - sending setup config now`);
 
           // Build and send setup config immediately; do not wait for handleMediaStream
@@ -8156,12 +7901,12 @@ router.post('/make-call', async (req, res) => {
             });
             preWs.send(JSON.stringify(setupConfig));
             preWs._setupSent = true;
-            preWs._setupSentAt = Date.now();
             log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Setup config sent during pre-dial (voice: ${voiceNamePW})`);
           } catch (setupErr) {
             log.warn('TIMING', `Pre-dial setup config failed: ${setupErr.message} - will retry in handleMediaStream`);
             preWs._setupSent = false;
           }
+          done();
         });
         
         // Listen for setupComplete during ringing
@@ -8170,15 +7915,9 @@ router.post('/make-call', async (req, res) => {
             const resp = JSON.parse(data.toString());
             if (resp.setupComplete || resp.setup_complete) {
               preWs._setupComplete = true;
-              preWs._setupCompleteAt = Date.now();
-              const setupLatencyMs = preWs._setupSentAt ? (preWs._setupCompleteAt - preWs._setupSentAt) : null;
-              const openToReadyMs = preWs._openedAt ? (preWs._setupCompleteAt - preWs._openedAt) : null;
-              log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Gemini setupComplete during ringing - zero post-pickup delay${setupLatencyMs != null ? `, setup->ready=${setupLatencyMs}ms` : ''}${openToReadyMs != null ? `, open->ready=${openToReadyMs}ms` : ''}`);
-              done();
+              log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Gemini setupComplete during ringing - zero post-pickup delay`);
             }
-          } catch (err) {
-            log.warn('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Failed to parse prewarm Gemini message: ${err.message}`);
-          }
+          } catch {}
         });
         
         preWs.on('error', (err) => {
@@ -8193,13 +7932,8 @@ router.post('/make-call', async (req, res) => {
           done();
         });
         PREWARMED_GEMINI_WS.set(convId, preWs);
-        // Safety: do not block dialing forever; cap setupComplete wait.
-        setTimeout(() => {
-          if (!resolved) {
-            log.warn('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Gemini pre-warm setupComplete timed out after ${RESOURCE_LIMITS.GEMINI_PREWARM_TIMEOUT_MS}ms - dialing with fallback readiness`);
-            done();
-          }
-        }, RESOURCE_LIMITS.GEMINI_PREWARM_TIMEOUT_MS);
+        // Safety: do not block dialing forever; cap prewarm wait at 3s.
+        setTimeout(done, 3000);
         // Auto-cleanup after 45s if call never connects
         setTimeout(() => {
           if (PREWARMED_GEMINI_WS.get(convId) === preWs) {
@@ -8218,9 +7952,9 @@ router.post('/make-call', async (req, res) => {
     await Promise.allSettled([warmPromise, geminiPrewarmPromise]);
 
     const preWsState = PREWARMED_GEMINI_WS.get(convId);
-    const geminiReady = preWsState && preWsState.readyState === WebSocket.OPEN && preWsState._setupComplete === true;
+    const geminiReady = preWsState && preWsState.readyState === WebSocket.OPEN;
     const greetingReady = callAssets.openingGreetingPayloads?.length > 0;
-    log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Pre-dial ready - Gemini: ${geminiReady ? 'LISTENING(setupComplete)' : 'pending'}, Greeting: ${greetingReady ? callAssets.openingGreetingPayloads.length + ' chunks' : 'fallback'}`);
+    log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Pre-dial ready - Gemini: ${geminiReady ? 'OPEN' : 'pending'}, Greeting: ${greetingReady ? callAssets.openingGreetingPayloads.length + ' chunks' : 'fallback'}`);
 
     // ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
     // PHASE 2: DIAL TWILIO (everything is ready)
@@ -9383,58 +9117,18 @@ export async function makeCallInternal(params) {
     }
 
     // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ PHASE 1: PREPARE EVERYTHING BEFORE DIALING (concurrent, with timeout) ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
-    const { assets: callAssets, warmPromise } = startCallAssetWarmup(callContext, { preparedScript, fetchTwilioRecording: true, maxPtpDays: params.maxPtpDays || 5, noiseCancellation: noiseCancellation === true });
+    const { warmPromise } = startCallAssetWarmup(callContext, { preparedScript, fetchTwilioRecording: true, maxPtpDays: params.maxPtpDays || 5, noiseCancellation: noiseCancellation === true });
 
     const geminiApiKey = getGeminiApiKey();
     let geminiPrewarmPromise = Promise.resolve();
     if (geminiApiKey && PREWARMED_GEMINI_WS.size < RESOURCE_LIMITS.MAX_PREWARM_WS) {
       geminiPrewarmPromise = new Promise((resolve) => {
         const geminiURL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${geminiApiKey}`;
-        const preWs = new WebSocket(geminiURL, { perMessageDeflate: false, skipUTF8Validation: true, handshakeTimeout: 5000 });
+        const preWs = new WebSocket(geminiURL);
         preWs._prewarmCreatedAt = Date.now();
-        preWs._setupSent = false;
-        preWs._setupComplete = false;
-        preWs._openedAt = 0;
-        preWs._setupSentAt = 0;
-        preWs._setupCompleteAt = 0;
         let resolved = false;
         const done = () => { if (!resolved) { resolved = true; resolve(); } };
-        preWs.on('open', () => {
-          preWs._openedAt = Date.now();
-          try {
-            const setupConfig = buildPrewarmSetupConfig({
-              convData: callContext,
-              callAssets,
-              voiceName: usedCallerVoice,
-              custGender: usedCustGender,
-              callerGender: usedCallerGender,
-              systemPrompt: params.systemPrompt || null,
-              maxPtpDays: params.maxPtpDays || 5,
-            });
-            preWs.send(JSON.stringify(setupConfig));
-            preWs._setupSent = true;
-            preWs._setupSentAt = Date.now();
-            log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Scheduler pre-dial setup sent (voice: ${usedCallerVoice})`);
-          } catch (setupErr) {
-            log.warn('SCHEDULER', `Scheduler pre-warm setup failed for ${customerName}: ${setupErr.message}`);
-            preWs._setupSent = false;
-          }
-        });
-        preWs.on('message', (data) => {
-          try {
-            const resp = JSON.parse(data.toString());
-            if (resp.setupComplete || resp.setup_complete) {
-              preWs._setupComplete = true;
-              preWs._setupCompleteAt = Date.now();
-              const setupLatencyMs = preWs._setupSentAt ? (preWs._setupCompleteAt - preWs._setupSentAt) : null;
-              const openToReadyMs = preWs._openedAt ? (preWs._setupCompleteAt - preWs._openedAt) : null;
-              log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Scheduler Gemini setupComplete during pre-dial${setupLatencyMs != null ? `, setup->ready=${setupLatencyMs}ms` : ''}${openToReadyMs != null ? `, open->ready=${openToReadyMs}ms` : ''}`);
-              done();
-            }
-          } catch (err) {
-            log.warn('SCHEDULER', `[PREP T+${Date.now()-DIAL_T0}ms] Failed to parse scheduler prewarm Gemini message: ${err.message}`);
-          }
-        });
+        preWs.on('open', () => done());
         preWs.on('error', (err) => {
           log.warn('SCHEDULER', `Gemini pre-warm error for ${customerName}: ${err.message}`);
           PREWARMED_GEMINI_WS.delete(convId);
@@ -9442,12 +9136,7 @@ export async function makeCallInternal(params) {
         });
         preWs.on('close', () => { if (PREWARMED_GEMINI_WS.get(convId) === preWs) PREWARMED_GEMINI_WS.delete(convId); done(); });
         PREWARMED_GEMINI_WS.set(convId, preWs);
-        setTimeout(() => {
-          if (!resolved) {
-            log.warn('SCHEDULER', `Gemini pre-warm setupComplete timeout for ${customerName} after ${RESOURCE_LIMITS.GEMINI_PREWARM_TIMEOUT_MS}ms`);
-            done();
-          }
-        }, RESOURCE_LIMITS.GEMINI_PREWARM_TIMEOUT_MS);
+        setTimeout(done, RESOURCE_LIMITS.GEMINI_PREWARM_TIMEOUT_MS);
         setTimeout(() => {
           if (PREWARMED_GEMINI_WS.get(convId) === preWs) cleanupPrewarmed(convId);
         }, 45000);
@@ -9457,12 +9146,7 @@ export async function makeCallInternal(params) {
     }
 
     await Promise.allSettled([warmPromise, geminiPrewarmPromise]);
-    {
-      const preWsState = PREWARMED_GEMINI_WS.get(convId);
-      const geminiReady = preWsState && preWsState.readyState === WebSocket.OPEN && preWsState._setupComplete === true;
-      const greetingReady = callAssets.openingGreetingPayloads?.length > 0;
-      log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Scheduler pre-dial ready - Gemini: ${geminiReady ? 'LISTENING(setupComplete)' : 'pending'}, Greeting: ${greetingReady ? callAssets.openingGreetingPayloads.length + ' chunks' : 'fallback'}`);
-    }
+    log.info('TIMING', `[PREP T+${Date.now()-DIAL_T0}ms] Scheduler call pre-warmed ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â dialing now`);
 
     // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ PHASE 2: DIAL (with timeout protection) ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
     const maxPtpDate = new Date(Date.now() + 5 * 86400000).toISOString().split('T')[0];
