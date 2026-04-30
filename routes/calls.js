@@ -3125,7 +3125,7 @@ function buildSemanticSignalMatrix(normalizedCustomer, normalizedTranscript, mes
   const ptpFromAgent = agentHints.ptpFromAgent
     ? {
         final_response: 'ptp_secured',
-        ptp_date: agentHints.extractedPtpDate || smartExtractPtpDate(normalizedTranscript),
+        ptp_date: smartExtractPtpDate(normalizedCustomer) || agentHints.extractedPtpDate || smartExtractPtpDate(normalizedTranscript),
         ptp_status: 'pending',
         notes: 'Customer ne short reply ke sath agent-confirmed payment date di',
         schedule_retry_hours: 0,
@@ -3332,7 +3332,7 @@ function deriveAgentSemanticHints(messages = [], transcript = '') {
       (hasAffirmAfter || (customerLowSignal && hasNoisyAckAfter))
     ) {
       ptpConfirmedByAgent = true;
-      ptpDateFromAgent = ptpDateFromAgent || smartExtractPtpDate(agentText) || smartExtractPtpDate(transcript);
+      ptpDateFromAgent = ptpDateFromAgent || smartExtractPtpDate(agentText);
     }
 
     if (forcedChoicePrompt && hasAffirmAfter) {
@@ -3721,7 +3721,7 @@ export async function analyzeConversation(messages, conv, options = {}) {
       ['callback_requested', 'busy', null].includes(normalized.final_response)
     ) {
       normalized.final_response = 'ptp_secured';
-      normalized.ptp_date = agentHints.extractedPtpDate || smartExtractPtpDate(customerOnlyText || transcript);
+      normalized.ptp_date = smartExtractPtpDate(customerOnlyText || transcript) || agentHints.extractedPtpDate;
       normalized.ptp_status = 'pending';
       normalized.schedule_retry_hours = getSemanticRetryHours('ptp_secured');
       normalized.notes = 'Customer transcript low-signal tha, agent-confirmed PTP date ko final maana gaya';
@@ -4278,15 +4278,32 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let geminiReconnectAttempts = 0;
   let geminiRecovering = false;
   const MAX_GEMINI_RECONNECTS = 4;
+  let lockedSessionVoiceName = '';
+  let lockedSessionCallerGender = '';
 
-  function getSessionVoiceName(metadata = {}, assetMeta = {}) {
+  function getSessionVoiceProfile(metadata = {}, assetMeta = {}, options = {}) {
+    const preferLocked = options.preferLocked !== false;
+    if (preferLocked && lockedSessionVoiceName) {
+      return {
+        voiceName: lockedSessionVoiceName,
+        callerGender: normalizeGender(lockedSessionCallerGender || 'female', 'female'),
+      };
+    }
+
+    const callerName = metadata.agentName || metadata.callerName || assetMeta.caller_name || conv?.caller_name || conv?.callerName || 'Omar';
+    const requestedVoice = assetMeta.voice || metadata.voice || conv?.voice || conv?.callerVoice || '';
     const callerGender = resolveCallerGender(
       metadata.callerGender || assetMeta.caller_gender || conv?.caller_gender || conv?.callerGender,
-      metadata.agentName || metadata.callerName || assetMeta.caller_name || conv?.caller_name || conv?.callerName || 'Omar',
-      'male'
+      callerName,
+      'female',
+      requestedVoice
     );
-    const requestedVoice = assetMeta.voice || metadata.voice || conv?.voice || conv?.callerVoice || '';
-    return normalizeVoiceName(requestedVoice, callerGender);
+    const voiceName = normalizeVoiceName(requestedVoice, callerGender);
+    return { voiceName, callerGender };
+  }
+
+  function getSessionVoiceName(metadata = {}, assetMeta = {}) {
+    return getSessionVoiceProfile(metadata, assetMeta).voiceName;
   }
 
   // Helper: update registry whenever geminiWs changes
@@ -4435,9 +4452,10 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   };
   const preSetupAudioBuffer = [];
   const MAX_PRE_SETUP_AUDIO_PACKETS = 150;
-  const INITIAL_CUSTOMER_RESPONSE_TIMEOUT_MS = 9000;
-  const CONNECTIVITY_FOLLOWUP_INTERVAL_MS = 9000;
+  const INITIAL_CUSTOMER_RESPONSE_TIMEOUT_MS = 10500;
+  const CONNECTIVITY_FOLLOWUP_INTERVAL_MS = 11000;
   const MAX_CONNECTIVITY_FOLLOWUPS = 5;
+  const POST_AGENT_CUSTOMER_RESPONSE_GRACE_MS = 3200;
   let connectivityFollowupCount = 0;
   const GREETING_CHUNK_INTERVAL_MS = 20;
   const GREETING_START_DELAY_MS = 20;
@@ -4485,7 +4503,8 @@ export function handleMediaStream(twilioWs, initialConversationId) {
 
   // ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â AGENT RESPONSE WATCHDOG ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â nudge Gemini if no audio after customer speech ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
   let agentResponseWatchdog = null;
-  const AGENT_RESPONSE_TIMEOUT_MS = 4500;
+  const AGENT_RESPONSE_TIMEOUT_MS = 4200;
+  const MIN_CUSTOMER_TURN_END_GAP_MS = 700;
 
   function startAgentWatchdog() {
     clearAgentWatchdog();
@@ -4494,12 +4513,25 @@ export function handleMediaStream(twilioWs, initialConversationId) {
       agentResponseWatchdog = null;
       if (!wsGemini || wsGemini.readyState !== WebSocket.OPEN || !geminiSetupComplete) return;
       if (conversationEnded || forceEndingCall || closingRequested) return;
+
+      // Do not nudge while customer is likely still speaking or transcript chunks are still aggregating.
+      const customerStillTalking = Boolean(customerTranscriptTimer)
+        || (Date.now() - lastNoiseActivityAt < MIN_CUSTOMER_TURN_END_GAP_MS);
+      if (customerStillTalking) {
+        startAgentWatchdog();
+        return;
+      }
+
       log.warn('MEDIA', `[WATCHDOG] No agent audio for ${AGENT_RESPONSE_TIMEOUT_MS}ms after customer speech ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â nudging Gemini`);
       broadcast({ type: 'LOG', message: 'ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Agent response delayed ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â nudging AI', source: 'sys' });
+      const latestCustomerContext = (lastCustomerText || customerTranscriptBuffer || '').trim();
+      const contextualNudge = latestCustomerContext
+        ? `RESPOND NOW. Customer is waiting. Current state: ${currentConversationState}. Customer said: "${latestCustomerContext}". Reply in ONE short, natural Roman Urdu sentence that directly answers the customer.`
+        : `RESPOND NOW. Customer is waiting. Current state: ${currentConversationState}. Give a brief, natural Roman Urdu response. Do NOT think internally.`;
       try {
         wsGemini.send(JSON.stringify({
           client_content: {
-            turns: [{ role: 'user', parts: [{ text: 'RESPOND NOW. Customer is waiting. Speak immediately in Roman Urdu ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â give a brief, natural response. Do NOT think internally.' }] }],
+            turns: [{ role: 'user', parts: [{ text: contextualNudge }] }],
             turn_complete: true,
           },
         }));
@@ -4523,7 +4555,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   let customerTranscriptBuffer = '';
   let customerTranscriptRawBuffer = '';
   let customerTranscriptTimer = null;
-  const CUSTOMER_TRANSCRIPT_DEBOUNCE_MS = 350; // Flush faster so first customer turn is handled with minimal delay
+  const CUSTOMER_TRANSCRIPT_DEBOUNCE_MS = 320; // Wait slightly longer so customer can finish naturally before reply
   let customerFirstWordLogged = false;
 
   let agentTranscriptBuffer = '';
@@ -4724,6 +4756,42 @@ export function handleMediaStream(twilioWs, initialConversationId) {
     log.info('MEDIA', `[GREETING] Replayed audio-only (${payloadsToPlay.length} chunks)`);
   }
 
+  async function playFallbackClosingAudio(trigger = 'end_call_marker') {
+    const custGender = normalizeGender(conv?.customer_gender || callAssets?.customer_gender || 'male', 'male');
+    const honor = custGender === 'female' ? 'Sahiba' : 'Sahab';
+    const custName = conv?.customer_name || callAssets?.customer_name || '';
+    const nameTag = custName ? `${custName} ${honor}` : honor;
+    const sessionVoice = getSessionVoiceProfile(startEventMetadata || {}, callAssets || {}, { preferLocked: true });
+    const callerGender = sessionVoice.callerGender;
+    const voiceName = sessionVoice.voiceName;
+    const closingText = `Theek hai ${nameTag}. Aaj ke liye itna hi. Shukriya. Allah Hafiz.`;
+
+    try {
+      const result = await generatePreparedGreetingAudio(voiceName, closingText, callerGender);
+      if (!result?.payloads?.length) {
+        throw new Error('fallback closing audio empty');
+      }
+      if (conversationEnded || forceEndingCall || !streamSid || twilioWs.readyState !== WebSocket.OPEN) {
+        throw new Error('twilio stream unavailable for fallback closing');
+      }
+      sendTwilioPayloadSequence(result.payloads, {
+        intervalMs: GREETING_CHUNK_INTERVAL_MS,
+        initialDelayMs: GREETING_START_DELAY_MS,
+        stopIf: () => conversationEnded || forceEndingCall,
+      });
+      lastGeminiSendAt = Date.now();
+      log.info('MEDIA', `[FALLBACK-CLOSING] Played local closing audio (${trigger}, ${result.durationMs}ms)`);
+      broadcast({ type: 'LOG', message: 'Fallback closing audio played', source: 'sys' });
+      return true;
+    } catch (err) {
+      finalClosingPromptSent = false;
+      suppressCustomerInputDuringEnding = false;
+      finalClosingPlaybackLock = false;
+      log.warn('MEDIA', `Fallback closing audio failed (${trigger}): ${err.message}`);
+      return false;
+    }
+  }
+
   function sendTwilioPayloadSequence(payloads = [], options = {}) {
     const intervalMs = Number(options.intervalMs || 20);
     const initialDelayMs = Number(options.initialDelayMs || 0);
@@ -4759,7 +4827,7 @@ export function handleMediaStream(twilioWs, initialConversationId) {
   // ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â SILENCE TIMEOUT ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 3 nudges (30s each) with context resume, then polite goodbye ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
   let silenceTimer = null;
   let silenceNudgeCount = 0;
-  const SILENCE_NUDGE_MS = 30000;       // 30s between each nudge
+  const SILENCE_NUDGE_MS = 35000;       // 35s between each nudge (more natural customer pause room)
   const MAX_SILENCE_NUDGES = 3;         // 3 nudges before final goodbye
   const SILENCE_FINAL_WAIT_MS = 15000;  // 15s after last nudge ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ hangup
 
@@ -4901,8 +4969,15 @@ export function handleMediaStream(twilioWs, initialConversationId) {
 
   function requestFinalClosingLine(trigger = 'end_call_marker') {
     if (finalClosingPromptSent) return false;
-    if (!wsGemini || wsGemini.readyState !== WebSocket.OPEN || !geminiSetupComplete) return false;
     if (conversationEnded || forceEndingCall) return false;
+
+    if (!wsGemini || wsGemini.readyState !== WebSocket.OPEN || !geminiSetupComplete) {
+      finalClosingPromptSent = true;
+      suppressCustomerInputDuringEnding = true;
+      finalClosingPlaybackLock = true;
+      void playFallbackClosingAudio(trigger);
+      return true;
+    }
 
     const custGender = normalizeGender(conv?.customer_gender || callAssets?.customer_gender || 'male', 'male');
     const honor = custGender === 'female' ? 'Sahiba' : 'Sahab';
@@ -4983,15 +5058,21 @@ export function handleMediaStream(twilioWs, initialConversationId) {
       initialCustomerResponseTimer = null;
       if (conversationEnded || forceEndingCall || closingRequested || customerTurnsHeard > 0) return;
 
+      const now = Date.now();
+      const postAudioGraceRemainingMs = lastAgentAudioSentAt > 0
+        ? Math.max(0, POST_AGENT_CUSTOMER_RESPONSE_GRACE_MS - (now - lastAgentAudioSentAt))
+        : 0;
+      const playbackTailRemainingMs = Math.max(0, agentPlaybackActiveUntil - now);
+
       const playbackStillActive =
         greetingPlaybackLock ||
         Boolean(agentTranscriptTimer) ||
-        Date.now() < agentPlaybackActiveUntil ||
-        (lastAgentAudioSentAt > 0 && Date.now() - lastAgentAudioSentAt < 1800);
+        playbackTailRemainingMs > 0 ||
+        postAudioGraceRemainingMs > 0;
 
       if (playbackStillActive) {
         log.info('TIMING', `[PICKUP-VERIFY] Deferring connectivity follow-up - agent playback still active`);
-        startInitialCustomerResponseTimer(1800);
+        startInitialCustomerResponseTimer(Math.max(1200, playbackTailRemainingMs, postAudioGraceRemainingMs));
         return;
       }
 
@@ -5026,11 +5107,13 @@ export function handleMediaStream(twilioWs, initialConversationId) {
     const requiresSpokenFinalLine =
       reason === 'customer_goodbye' ||
       reason === 'agent_closing' ||
+      reason === 'gemini_disconnected' ||
       reason === 'no_customer_audio_after_pickup' ||
       reason === 'silence_timeout' ||
       reason === 'off_topic_timeout' ||
       reason.startsWith('non_customer');
     if (requiresSpokenFinalLine && delayMs < 7800) delayMs = 7800;
+    if (reason === 'gemini_disconnected' && delayMs < 9800) delayMs = 9800;
     if (requiresSpokenFinalLine && !finalClosingPromptSent) {
       requestFinalClosingLine(`schedule_${reason}`);
     }
@@ -6331,6 +6414,8 @@ Stay on the call. Keep negotiating. This is attempt ${ptpNegotiationAttempts}/${
         'male'
       );
       const voiceName = getSessionVoiceName(metadata, assetMeta);
+      lockedSessionCallerGender = callerGender;
+      lockedSessionVoiceName = voiceName;
       const dpdValue = Number(assetMeta.dpd ?? conv?.dpd ?? 0);
       const followUpValue = Number(assetMeta.follow_up_count ?? conv?.follow_up_count ?? 0);
       const ptpStatusValue = assetMeta.ptp_status || conv?.ptp_status || 'None';
@@ -6681,7 +6766,7 @@ FOLLOW-UP STRATEGY (CRITICAL):
             automatic_activity_detection: {
               disabled: false,
               prefix_padding_ms: 250,       // Capture more speech onset (was 100 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â missed first syllable)
-              silence_duration_ms: 450,      // Shorter VAD end-of-turn to reduce post-greeting response delay
+              silence_duration_ms: 600,      // Slightly longer end-of-turn so customer can finish before agent responds
             }
           }
         }
@@ -6734,6 +6819,7 @@ FOLLOW-UP STRATEGY (CRITICAL):
             log.info('MEDIA', `[GATE-DIAGNOSTIC] Empty input transcription during greeting-gate (likely VAD activity without recognized speech)`);
           }
           if (customerText) {
+            lastNoiseActivityAt = Date.now();
             const rawCustomerTranscript = String(customerText || '').replace(/\s+/g, ' ').trim();
             const normalizedForLog = normalizeTranscriptToRomanUrdu(customerText);
             
